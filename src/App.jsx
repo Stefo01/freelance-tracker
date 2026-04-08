@@ -57,9 +57,9 @@ export default function App() {
             Resoconto
           </button>
         </nav>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <span style={{ fontSize: 12, color: 'var(--text-muted)' }}>{session.user.email}</span>
-          <button className="btn" style={{ padding: '5px 12px', fontSize: 12 }} onClick={handleLogout}>
+        <div className="topbar-user">
+          <span className="topbar-email">{session.user.email}</span>
+          <button className="btn" style={{ padding: '5px 10px', fontSize: 12 }} onClick={handleLogout}>
             Esci
           </button>
         </div>

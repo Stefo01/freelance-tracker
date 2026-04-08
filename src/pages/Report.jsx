@@ -1,359 +1,206 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect } from 'react'
 import { supabase } from '../lib/supabase'
 
-const COLORS = [
-  '#7c6af7', '#3ecf8e', '#f46a6a', '#f59e0b',
-  '#38bdf8', '#e879f9', '#fb923c', '#a3e635'
-]
-
-const CACHE_KEY = 'ft_cache'
-const PENDING_KEY = 'ft_pending'
-
-function fmtTime(seconds) {
+function fmtHours(seconds) {
   const h = Math.floor(seconds / 3600)
   const m = Math.floor((seconds % 3600) / 60)
-  const s = seconds % 60
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+  if (h === 0) return `${m}m`
+  return `${h}h ${m}m`
 }
 
-function fmtHours(seconds) {
-  return (seconds / 3600).toFixed(1) + 'h'
-}
-
-function todayStart() {
-  const d = new Date()
-  d.setHours(0, 0, 0, 0)
-  return d.toISOString()
-}
-
-// ── Cache helpers ─────────────────────────────────────────────────────
-function readCache() {
-  try { return JSON.parse(localStorage.getItem(CACHE_KEY) || 'null') } catch { return null }
-}
-function writeCache(data) {
-  localStorage.setItem(CACHE_KEY, JSON.stringify(data))
-}
-function readPending() {
-  try { return JSON.parse(localStorage.getItem(PENDING_KEY) || '[]') } catch { return [] }
-}
-function writePending(ops) {
-  localStorage.setItem(PENDING_KEY, JSON.stringify(ops))
-}
-function addPending(op) {
-  writePending([...readPending(), op])
-}
-
-export default function Tracker({ userId }) {
-  const [projects, setProjects] = useState([])
-  const [allTotals, setAllTotals] = useState({})     // { pid: seconds } tutto il tempo (entry chiuse)
-  const [todayTotals, setTodayTotals] = useState({}) // { pid: seconds } oggi (entry chiuse)
-  const [timers, setTimers] = useState({})            // { pid: { startMs, entryId, elapsed } }
-  const [loading, setLoading] = useState(true)
-  const [offline, setOffline] = useState(false)
-  const [showModal, setShowModal] = useState(false)
-  const [newName, setNewName] = useState('')
-  const [selectedColor, setSelectedColor] = useState(0)
-  const intervalsRef = useRef({})
-
-  useEffect(() => {
-    loadData()
-    return () => { Object.values(intervalsRef.current).forEach(clearInterval) }
-  }, [])
-
-  useEffect(() => {
-    window.addEventListener('online', syncPending)
-    return () => window.removeEventListener('online', syncPending)
-  }, [])
-
-  // ── Sync pending ops ──────────────────────────────────────────────────
-  async function syncPending() {
-    const ops = readPending()
-    if (!ops.length) return
-    const failed = []
-    for (const op of ops) {
-      try {
-        if (op.type === 'insert_project') await supabase.from('projects').insert(op.data)
-        else if (op.type === 'insert_entry') await supabase.from('time_entries').insert(op.data)
-        else if (op.type === 'update_entry') await supabase.from('time_entries').update(op.data).eq('id', op.id)
-        else if (op.type === 'delete_project') await supabase.from('projects').delete().eq('id', op.id)
-      } catch { failed.push(op) }
-    }
-    writePending(failed)
-    if (!failed.length) { setOffline(false); loadData() }
+function getDateRange(period, dateFrom, dateTo) {
+  const now = new Date()
+  if (period === 'today') {
+    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate())
+    return { from: start.toISOString(), to: now.toISOString() }
   }
-
-  // ── Load data — ricostruisce i timer aperti dal DB ─────────────────────
-  async function loadData() {
-    setLoading(true)
-
-    const { data: projs, error } = await supabase
-      .from('projects').select('*').order('created_at', { ascending: true })
-
-    if (error || !projs) {
-      // Offline: usa cache e ricostruisce timer da localStorage
-      const cache = readCache()
-      if (cache) {
-        setProjects(cache.projects || [])
-        setAllTotals(cache.allTotals || {})
-        setTodayTotals(cache.todayTotals || {})
-        // Ricostruisci timer aperti da cache
-        if (cache.openTimers) restoreTimers(cache.openTimers)
-        setOffline(true)
-      }
-      setLoading(false)
-      return
+  if (period === 'week') return { from: new Date(now - 7 * 86400000).toISOString(), to: now.toISOString() }
+  if (period === 'month') return { from: new Date(now - 30 * 86400000).toISOString(), to: now.toISOString() }
+  if (period === 'year') return { from: new Date(now - 365 * 86400000).toISOString(), to: now.toISOString() }
+  if (period === 'custom') {
+    return {
+      from: dateFrom ? new Date(dateFrom).toISOString() : null,
+      to: dateTo ? new Date(dateTo + 'T23:59:59').toISOString() : null
     }
+  }
+  return { from: null, to: null }
+}
 
-    // Totali entry CHIUSE — tutto il tempo
-    const { data: allEntries } = await supabase
-      .from('time_entries').select('project_id, duration').not('ended_at', 'is', null)
+export default function Report({ userId }) {
+  const [projects, setProjects] = useState([])
+  const [rows, setRows] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [filterProject, setFilterProject] = useState('all')
+  const [filterPeriod, setFilterPeriod] = useState('month')
+  const [dateFrom, setDateFrom] = useState('')
+  const [dateTo, setDateTo] = useState('')
 
-    const aTotals = {}
-    allEntries?.forEach(e => { aTotals[e.project_id] = (aTotals[e.project_id] || 0) + (e.duration || 0) })
+  // Carica prima i progetti, poi subito dopo il report
+  useEffect(() => {
+    async function init() {
+      const { data } = await supabase.from('projects').select('*').order('created_at')
+      const projs = data || []
+      setProjects(projs)
+      await loadReport(projs, filterProject, filterPeriod, dateFrom, dateTo)
+    }
+    init()
+  }, [])
 
-    // Totali entry CHIUSE — solo oggi
-    const { data: todayEntries } = await supabase
-      .from('time_entries').select('project_id, duration')
-      .not('ended_at', 'is', null).gte('started_at', todayStart())
+  // Ricarica il report al cambio filtri (projects già disponibili)
+  useEffect(() => {
+    if (!projects.length && filterPeriod === 'month' && filterProject === 'all') return // skip primo render
+    loadReport(projects, filterProject, filterPeriod, dateFrom, dateTo)
+  }, [filterProject, filterPeriod, dateFrom, dateTo])
 
-    const tTotals = {}
-    todayEntries?.forEach(e => { tTotals[e.project_id] = (tTotals[e.project_id] || 0) + (e.duration || 0) })
+  async function loadReport(projs, fprojekt, fperiod, dfrom, dto) {
+    setLoading(true)
+    const { from, to } = getDateRange(fperiod, dfrom, dto)
 
-    // Entry APERTE (ended_at IS NULL) → timer ancora in corso
-    // Queste sono sessioni avviate e mai chiuse — riprende il conto da started_at
-    const { data: openEntries } = await supabase
-      .from('time_entries').select('id, project_id, started_at').is('ended_at', null)
+    let query = supabase
+      .from('time_entries')
+      .select('project_id, duration, started_at')
+      .not('ended_at', 'is', null)
 
-    const openTimers = {}
-    openEntries?.forEach(e => {
-      openTimers[e.project_id] = { entryId: e.id, startedAt: e.started_at }
+    if (from) query = query.gte('started_at', from)
+    if (to)   query = query.lte('started_at', to)
+    if (fprojekt !== 'all') query = query.eq('project_id', fprojekt)
+
+    const { data: entries, error } = await query
+    if (error) { console.error(error); setLoading(false); return }
+
+    const map = {}
+    entries?.forEach(e => {
+      if (!map[e.project_id]) map[e.project_id] = { totalSeconds: 0, sessions: 0 }
+      map[e.project_id].totalSeconds += e.duration || 0
+      map[e.project_id].sessions += 1
     })
 
-    setProjects(projs)
-    setAllTotals(aTotals)
-    setTodayTotals(tTotals)
-    setOffline(false)
+    const relevantProjects = fprojekt === 'all' ? projs : projs.filter(p => p.id === fprojekt)
+    const result = relevantProjects
+      .map(p => ({ project: p, ...(map[p.id] || { totalSeconds: 0, sessions: 0 }) }))
+      .filter(r => r.totalSeconds > 0)
+      .sort((a, b) => b.totalSeconds - a.totalSeconds)
 
-    writeCache({ projects: projs, allTotals: aTotals, todayTotals: tTotals, openTimers })
-
-    // Riavvia i timer aperti
-    restoreTimers(openTimers)
-
+    setRows(result)
     setLoading(false)
   }
 
-  // ── Ricostruisce i timer da { pid: { entryId, startedAt } } ──────────
-  function restoreTimers(openTimers) {
-    // Pulisci eventuali timer precedenti
-    Object.values(intervalsRef.current).forEach(clearInterval)
-    intervalsRef.current = {}
-
-    const restoredTimers = {}
-    Object.entries(openTimers).forEach(([pid, { entryId, startedAt }]) => {
-      const startMs = new Date(startedAt).getTime()
-      const elapsed = Math.floor((Date.now() - startMs) / 1000)
-      restoredTimers[pid] = { startMs, entryId, elapsed }
-      // Avvia il tick
-      intervalsRef.current[pid] = setInterval(() => {
-        setTimers(prev => ({
-          ...prev,
-          [pid]: { ...prev[pid], elapsed: Math.floor((Date.now() - startMs) / 1000) }
-        }))
-      }, 1000)
-    })
-    setTimers(restoredTimers)
-  }
-
-  // ── Timer tick per nuove sessioni ─────────────────────────────────────
-  function startTicking(projectId, startMs) {
-    if (intervalsRef.current[projectId]) clearInterval(intervalsRef.current[projectId])
-    intervalsRef.current[projectId] = setInterval(() => {
-      setTimers(prev => ({
-        ...prev,
-        [projectId]: { ...prev[projectId], elapsed: Math.floor((Date.now() - startMs) / 1000) }
-      }))
-    }, 1000)
-  }
-
-  // ── Clock in / out ────────────────────────────────────────────────────
-  async function toggleTimer(project) {
-    const pid = project.id
-
-    if (timers[pid]) {
-      // ── Clock OUT ──
-      const { startMs, entryId } = timers[pid]
-      const endedAt = new Date().toISOString()
-      const duration = Math.floor((Date.now() - startMs) / 1000)
-
-      clearInterval(intervalsRef.current[pid])
-      delete intervalsRef.current[pid]
-
-      const { error } = await supabase
-        .from('time_entries').update({ ended_at: endedAt, duration }).eq('id', entryId)
-      if (error) { addPending({ type: 'update_entry', id: entryId, data: { ended_at: endedAt, duration } }); setOffline(true) }
-
-      setAllTotals(prev => ({ ...prev, [pid]: (prev[pid] || 0) + duration }))
-      setTodayTotals(prev => ({ ...prev, [pid]: (prev[pid] || 0) + duration }))
-      setTimers(prev => { const n = { ...prev }; delete n[pid]; return n })
-
-      // Aggiorna cache rimuovendo il timer aperto
-      const cache = readCache()
-      if (cache?.openTimers) {
-        delete cache.openTimers[pid]
-        writeCache(cache)
-      }
-
-    } else {
-      // ── Clock IN ──
-      const startMs = Date.now()
-      const startedAt = new Date(startMs).toISOString()
-      const tempId = 'local_' + startMs
-
-      const { data: entry, error } = await supabase
-        .from('time_entries').insert({ project_id: pid, started_at: startedAt }).select().single()
-
-      if (error) {
-        addPending({ type: 'insert_entry', data: { id: tempId, project_id: pid, started_at: startedAt } })
-        setOffline(true)
-      }
-
-      const entryId = entry?.id ?? tempId
-
-      // Salva il timer aperto in cache così sopravvive alla chiusura della PWA
-      const cache = readCache() || {}
-      cache.openTimers = { ...(cache.openTimers || {}), [pid]: { entryId, startedAt } }
-      writeCache(cache)
-
-      setTimers(prev => ({ ...prev, [pid]: { startMs, entryId, elapsed: 0 } }))
-      startTicking(pid, startMs)
+  function onFilterChange(setter, value, key) {
+    setter(value)
+    const state = {
+      fprojekt: filterProject,
+      fperiod: filterPeriod,
+      dfrom: dateFrom,
+      dto: dateTo,
+      [key]: value
     }
+    loadReport(projects, state.fprojekt, state.fperiod, state.dfrom, state.dto)
   }
 
-  // ── Add project ───────────────────────────────────────────────────────
-  async function addProject() {
-    const name = newName.trim()
-    if (!name) return
-    const color = COLORS[selectedColor]
-
-    const { data, error } = await supabase.from('projects').insert({ name, color, user_id: userId }).select().single()
-    const newProject = data ?? { id: 'local_' + Date.now(), name, color, user_id: userId, created_at: new Date().toISOString() }
-
-    if (error) { addPending({ type: 'insert_project', data: { name, color } }); setOffline(true) }
-
-    setProjects(prev => [...prev, newProject])
-    setNewName('')
-    setSelectedColor(0)
-    setShowModal(false)
-  }
-
-  // ── Delete project ─────────────────────────────────────────────────────
-  async function deleteProject(pid) {
-    if (!confirm('Eliminare il progetto? Tutti i dati di tempo verranno persi.')) return
-    if (timers[pid]) { clearInterval(intervalsRef.current[pid]); delete intervalsRef.current[pid] }
-
-    const { error } = await supabase.from('projects').delete().eq('id', pid)
-    if (error) { addPending({ type: 'delete_project', id: pid }); setOffline(true) }
-
-    setProjects(prev => prev.filter(p => p.id !== pid))
-    setTimers(prev => { const n = { ...prev }; delete n[pid]; return n })
-    setAllTotals(prev => { const n = { ...prev }; delete n[pid]; return n })
-    setTodayTotals(prev => { const n = { ...prev }; delete n[pid]; return n })
-  }
-
-  // ── Render ────────────────────────────────────────────────────────────
-  if (loading) return <div className="loading-overlay"><div className="spinner" /></div>
+  const totalSeconds = rows.reduce((s, r) => s + r.totalSeconds, 0)
+  const totalSessions = rows.reduce((s, r) => s + r.sessions, 0)
 
   return (
     <>
       <div className="page-header">
-        <h1 className="page-title">Progetti</h1>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          {offline && (
-            <span style={{ fontSize: 12, color: '#f59e0b', background: 'rgba(245,158,11,0.1)', border: '1px solid rgba(245,158,11,0.25)', borderRadius: 6, padding: '4px 10px' }}>
-              ⚠ offline — dati in cache
-            </span>
-          )}
-          <button className="btn btn-primary" onClick={() => setShowModal(true)}>
-            + Nuovo progetto
-          </button>
-        </div>
+        <h1 className="page-title">Resoconto</h1>
       </div>
 
-      <div className="projects-grid">
-        {projects.length === 0 && (
-          <div className="empty-state">
-            <p>Nessun progetto ancora.</p>
-            <button className="btn btn-primary" onClick={() => setShowModal(true)}>Crea il primo progetto</button>
-          </div>
+      <div className="filters-row">
+        <div className="filter-group">
+          <label className="filter-label">Progetto</label>
+          <select className="filter-select" value={filterProject}
+            onChange={e => { setFilterProject(e.target.value); onFilterChange(setFilterProject, e.target.value, 'fprojekt') }}>
+            <option value="all">Tutti i progetti</option>
+            {projects.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </div>
+
+        <div className="filter-group">
+          <label className="filter-label">Periodo</label>
+          <select className="filter-select" value={filterPeriod}
+            onChange={e => { setFilterPeriod(e.target.value); onFilterChange(setFilterPeriod, e.target.value, 'fperiod') }}>
+            <option value="all">Sempre</option>
+            <option value="today">Oggi</option>
+            <option value="week">Ultima settimana</option>
+            <option value="month">Ultimo mese</option>
+            <option value="year">Ultimo anno</option>
+            <option value="custom">Personalizzato</option>
+          </select>
+        </div>
+
+        {filterPeriod === 'custom' && (
+          <>
+            <div className="filter-group">
+              <label className="filter-label">Dal</label>
+              <input className="filter-input" type="date" value={dateFrom}
+                onChange={e => { setDateFrom(e.target.value); onFilterChange(setDateFrom, e.target.value, 'dfrom') }} />
+            </div>
+            <div className="filter-group">
+              <label className="filter-label">Al</label>
+              <input className="filter-input" type="date" value={dateTo}
+                onChange={e => { setDateTo(e.target.value); onFilterChange(setDateTo, e.target.value, 'dto') }} />
+            </div>
+          </>
         )}
-
-        {projects.map(p => {
-          const isActive = !!timers[p.id]
-          const elapsed = timers[p.id]?.elapsed ?? 0
-          // Counter grande = oggi completato + sessione attiva corrente
-          const todayDisplay = (todayTotals[p.id] || 0) + elapsed
-          // Totale storico = tutto + sessione attiva corrente
-          const grandTotal = (allTotals[p.id] || 0) + elapsed
-
-          return (
-            <div key={p.id} className={`project-card ${isActive ? 'clocked-in' : ''}`}>
-              <div className="project-card-header">
-                <div className="project-info">
-                  <span className="project-color-dot" style={{ background: p.color }} />
-                  <span className="project-name">{p.name}</span>
-                </div>
-                {isActive
-                  ? <span className="live-badge"><span className="live-dot" />live</span>
-                  : <button className="btn btn-danger" onClick={() => deleteProject(p.id)}>×</button>
-                }
-              </div>
-
-              <div className="project-total">Totale: {fmtHours(grandTotal)}</div>
-              <div className="timer-display">{fmtTime(todayDisplay)}</div>
-              <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: '0.75rem', marginTop: '-0.5rem' }}>
-                ore lavorate oggi
-              </div>
-
-              <button className={`clock-btn ${isActive ? 'active' : ''}`} onClick={() => toggleTimer(p)}>
-                {isActive ? '⏹ Clock Out' : '▶ Clock In'}
-              </button>
-            </div>
-          )
-        })}
       </div>
 
-      {showModal && (
-        <div className="modal-backdrop" onClick={e => e.target === e.currentTarget && setShowModal(false)}>
-          <div className="modal">
-            <h2 className="modal-title">Nuovo progetto</h2>
-            <div className="form-group">
-              <label className="form-label">Nome</label>
-              <input
-                className="form-input"
-                type="text"
-                placeholder="Es. Cliente Rossi – E-commerce"
-                value={newName}
-                onChange={e => setNewName(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && addProject()}
-                autoFocus
-              />
-            </div>
-            <div className="form-group">
-              <label className="form-label">Colore</label>
-              <div className="color-grid">
-                {COLORS.map((c, i) => (
-                  <div key={c} className={`color-swatch ${selectedColor === i ? 'selected' : ''}`}
-                    style={{ background: c }} onClick={() => setSelectedColor(i)} />
-                ))}
-              </div>
-            </div>
-            <div className="modal-actions">
-              <button className="btn" onClick={() => setShowModal(false)}>Annulla</button>
-              <button className="btn btn-primary" onClick={addProject}>Crea</button>
-            </div>
-          </div>
+      <div className="stats-row">
+        <div className="stat-card">
+          <div className="stat-label">Ore totali</div>
+          <div className="stat-value">{fmtHours(totalSeconds)}</div>
         </div>
-      )}
+        <div className="stat-card">
+          <div className="stat-label">Sessioni</div>
+          <div className="stat-value">{totalSessions}</div>
+        </div>
+        <div className="stat-card">
+          <div className="stat-label">Progetti</div>
+          <div className="stat-value">{rows.length}</div>
+        </div>
+      </div>
+
+      <div className="report-table-wrap">
+        <table className="report-table">
+          <thead>
+            <tr>
+              <th>Progetto</th>
+              <th>Sessioni</th>
+              <th>Ore totali</th>
+              <th>% sul totale</th>
+            </tr>
+          </thead>
+          <tbody>
+            {loading && <tr><td colSpan={4}><div className="spinner" /></td></tr>}
+            {!loading && rows.length === 0 && (
+              <tr><td colSpan={4} className="no-data">Nessun dato per il periodo selezionato.</td></tr>
+            )}
+            {!loading && rows.map(({ project: p, totalSeconds: sec, sessions }) => {
+              const pct = totalSeconds > 0 ? Math.round(sec / totalSeconds * 100) : 0
+              return (
+                <tr key={p.id}>
+                  <td>
+                    <div className="project-label">
+                      <span style={{ width: 10, height: 10, borderRadius: '50%', background: p.color, display: 'inline-block', flexShrink: 0 }} />
+                      {p.name}
+                    </div>
+                  </td>
+                  <td>{sessions}</td>
+                  <td><span className="hours-mono">{fmtHours(sec)}</span></td>
+                  <td>
+                    <div className="bar-wrap">
+                      <div className="bar-track">
+                        <div className="bar-fill" style={{ width: pct + '%', background: p.color }} />
+                      </div>
+                      <span className="bar-pct">{pct}%</span>
+                    </div>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
     </>
   )
 }
