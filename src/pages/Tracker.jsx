@@ -26,7 +26,7 @@ function todayStart() {
   return d.toISOString()
 }
 
-// ── Offline cache helpers ─────────────────────────────────────────────
+// ── Cache helpers ─────────────────────────────────────────────────────
 function readCache() {
   try { return JSON.parse(localStorage.getItem(CACHE_KEY) || 'null') } catch { return null }
 }
@@ -40,15 +40,13 @@ function writePending(ops) {
   localStorage.setItem(PENDING_KEY, JSON.stringify(ops))
 }
 function addPending(op) {
-  const ops = readPending()
-  ops.push(op)
-  writePending(ops)
+  writePending([...readPending(), op])
 }
 
 export default function Tracker() {
   const [projects, setProjects] = useState([])
-  const [allTotals, setAllTotals] = useState({})     // { pid: seconds } — tutto il tempo
-  const [todayTotals, setTodayTotals] = useState({}) // { pid: seconds } — solo oggi
+  const [allTotals, setAllTotals] = useState({})     // { pid: seconds } tutto il tempo (entry chiuse)
+  const [todayTotals, setTodayTotals] = useState({}) // { pid: seconds } oggi (entry chiuse)
   const [timers, setTimers] = useState({})            // { pid: { startMs, entryId, elapsed } }
   const [loading, setLoading] = useState(true)
   const [offline, setOffline] = useState(false)
@@ -63,12 +61,11 @@ export default function Tracker() {
   }, [])
 
   useEffect(() => {
-    const handleOnline = () => syncPending()
-    window.addEventListener('online', handleOnline)
-    return () => window.removeEventListener('online', handleOnline)
+    window.addEventListener('online', syncPending)
+    return () => window.removeEventListener('online', syncPending)
   }, [])
 
-  // ── Sync pending ops when back online ────────────────────────────────
+  // ── Sync pending ops ──────────────────────────────────────────────────
   async function syncPending() {
     const ops = readPending()
     if (!ops.length) return
@@ -85,7 +82,7 @@ export default function Tracker() {
     if (!failed.length) { setOffline(false); loadData() }
   }
 
-  // ── Load data ─────────────────────────────────────────────────────────
+  // ── Load data — ricostruisce i timer aperti dal DB ─────────────────────
   async function loadData() {
     setLoading(true)
 
@@ -93,42 +90,81 @@ export default function Tracker() {
       .from('projects').select('*').order('created_at', { ascending: true })
 
     if (error || !projs) {
+      // Offline: usa cache e ricostruisce timer da localStorage
       const cache = readCache()
       if (cache) {
         setProjects(cache.projects || [])
         setAllTotals(cache.allTotals || {})
         setTodayTotals(cache.todayTotals || {})
+        // Ricostruisci timer aperti da cache
+        if (cache.openTimers) restoreTimers(cache.openTimers)
         setOffline(true)
       }
       setLoading(false)
       return
     }
 
-    // Tutti i totali
+    // Totali entry CHIUSE — tutto il tempo
     const { data: allEntries } = await supabase
       .from('time_entries').select('project_id, duration').not('ended_at', 'is', null)
 
     const aTotals = {}
     allEntries?.forEach(e => { aTotals[e.project_id] = (aTotals[e.project_id] || 0) + (e.duration || 0) })
 
-    // Solo oggi
+    // Totali entry CHIUSE — solo oggi
     const { data: todayEntries } = await supabase
       .from('time_entries').select('project_id, duration')
-      .not('ended_at', 'is', null)
-      .gte('started_at', todayStart())
+      .not('ended_at', 'is', null).gte('started_at', todayStart())
 
     const tTotals = {}
     todayEntries?.forEach(e => { tTotals[e.project_id] = (tTotals[e.project_id] || 0) + (e.duration || 0) })
+
+    // Entry APERTE (ended_at IS NULL) → timer ancora in corso
+    // Queste sono sessioni avviate e mai chiuse — riprende il conto da started_at
+    const { data: openEntries } = await supabase
+      .from('time_entries').select('id, project_id, started_at').is('ended_at', null)
+
+    const openTimers = {}
+    openEntries?.forEach(e => {
+      openTimers[e.project_id] = { entryId: e.id, startedAt: e.started_at }
+    })
 
     setProjects(projs)
     setAllTotals(aTotals)
     setTodayTotals(tTotals)
     setOffline(false)
-    writeCache({ projects: projs, allTotals: aTotals, todayTotals: tTotals })
+
+    writeCache({ projects: projs, allTotals: aTotals, todayTotals: tTotals, openTimers })
+
+    // Riavvia i timer aperti
+    restoreTimers(openTimers)
+
     setLoading(false)
   }
 
-  // ── Timer tick ────────────────────────────────────────────────────────
+  // ── Ricostruisce i timer da { pid: { entryId, startedAt } } ──────────
+  function restoreTimers(openTimers) {
+    // Pulisci eventuali timer precedenti
+    Object.values(intervalsRef.current).forEach(clearInterval)
+    intervalsRef.current = {}
+
+    const restoredTimers = {}
+    Object.entries(openTimers).forEach(([pid, { entryId, startedAt }]) => {
+      const startMs = new Date(startedAt).getTime()
+      const elapsed = Math.floor((Date.now() - startMs) / 1000)
+      restoredTimers[pid] = { startMs, entryId, elapsed }
+      // Avvia il tick
+      intervalsRef.current[pid] = setInterval(() => {
+        setTimers(prev => ({
+          ...prev,
+          [pid]: { ...prev[pid], elapsed: Math.floor((Date.now() - startMs) / 1000) }
+        }))
+      }, 1000)
+    })
+    setTimers(restoredTimers)
+  }
+
+  // ── Timer tick per nuove sessioni ─────────────────────────────────────
   function startTicking(projectId, startMs) {
     if (intervalsRef.current[projectId]) clearInterval(intervalsRef.current[projectId])
     intervalsRef.current[projectId] = setInterval(() => {
@@ -144,7 +180,7 @@ export default function Tracker() {
     const pid = project.id
 
     if (timers[pid]) {
-      // Clock OUT
+      // ── Clock OUT ──
       const { startMs, entryId } = timers[pid]
       const endedAt = new Date().toISOString()
       const duration = Math.floor((Date.now() - startMs) / 1000)
@@ -152,15 +188,23 @@ export default function Tracker() {
       clearInterval(intervalsRef.current[pid])
       delete intervalsRef.current[pid]
 
-      const { error } = await supabase.from('time_entries').update({ ended_at: endedAt, duration }).eq('id', entryId)
+      const { error } = await supabase
+        .from('time_entries').update({ ended_at: endedAt, duration }).eq('id', entryId)
       if (error) { addPending({ type: 'update_entry', id: entryId, data: { ended_at: endedAt, duration } }); setOffline(true) }
 
       setAllTotals(prev => ({ ...prev, [pid]: (prev[pid] || 0) + duration }))
       setTodayTotals(prev => ({ ...prev, [pid]: (prev[pid] || 0) + duration }))
       setTimers(prev => { const n = { ...prev }; delete n[pid]; return n })
 
+      // Aggiorna cache rimuovendo il timer aperto
+      const cache = readCache()
+      if (cache?.openTimers) {
+        delete cache.openTimers[pid]
+        writeCache(cache)
+      }
+
     } else {
-      // Clock IN
+      // ── Clock IN ──
       const startMs = Date.now()
       const startedAt = new Date(startMs).toISOString()
       const tempId = 'local_' + startMs
@@ -168,9 +212,19 @@ export default function Tracker() {
       const { data: entry, error } = await supabase
         .from('time_entries').insert({ project_id: pid, started_at: startedAt }).select().single()
 
-      if (error) { addPending({ type: 'insert_entry', data: { id: tempId, project_id: pid, started_at: startedAt } }); setOffline(true) }
+      if (error) {
+        addPending({ type: 'insert_entry', data: { id: tempId, project_id: pid, started_at: startedAt } })
+        setOffline(true)
+      }
 
-      setTimers(prev => ({ ...prev, [pid]: { startMs, entryId: entry?.id ?? tempId, elapsed: 0 } }))
+      const entryId = entry?.id ?? tempId
+
+      // Salva il timer aperto in cache così sopravvive alla chiusura della PWA
+      const cache = readCache() || {}
+      cache.openTimers = { ...(cache.openTimers || {}), [pid]: { entryId, startedAt } }
+      writeCache(cache)
+
+      setTimers(prev => ({ ...prev, [pid]: { startMs, entryId, elapsed: 0 } }))
       startTicking(pid, startMs)
     }
   }
@@ -236,7 +290,9 @@ export default function Tracker() {
         {projects.map(p => {
           const isActive = !!timers[p.id]
           const elapsed = timers[p.id]?.elapsed ?? 0
+          // Counter grande = oggi completato + sessione attiva corrente
           const todayDisplay = (todayTotals[p.id] || 0) + elapsed
+          // Totale storico = tutto + sessione attiva corrente
           const grandTotal = (allTotals[p.id] || 0) + elapsed
 
           return (
@@ -253,9 +309,7 @@ export default function Tracker() {
               </div>
 
               <div className="project-total">Totale: {fmtHours(grandTotal)}</div>
-
               <div className="timer-display">{fmtTime(todayDisplay)}</div>
-
               <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: '0.75rem', marginTop: '-0.5rem' }}>
                 ore lavorate oggi
               </div>
