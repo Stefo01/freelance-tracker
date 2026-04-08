@@ -43,7 +43,7 @@ function addPending(op) {
   writePending([...readPending(), op])
 }
 
-export default function Tracker() {
+export default function Tracker({ userId }) {
   const [projects, setProjects] = useState([])
   const [allTotals, setAllTotals] = useState({})     // { pid: seconds } tutto il tempo (entry chiuse)
   const [todayTotals, setTodayTotals] = useState({}) // { pid: seconds } oggi (entry chiuse)
@@ -235,8 +235,8 @@ export default function Tracker() {
     if (!name) return
     const color = COLORS[selectedColor]
 
-    const { data, error } = await supabase.from('projects').insert({ name, color }).select().single()
-    const newProject = data ?? { id: 'local_' + Date.now(), name, color, created_at: new Date().toISOString() }
+    const { data, error } = await supabase.from('projects').insert({ name, color, user_id: userId }).select().single()
+    const newProject = data ?? { id: 'local_' + Date.now(), name, color, user_id: userId, created_at: new Date().toISOString() }
 
     if (error) { addPending({ type: 'insert_project', data: { name, color } }); setOffline(true) }
 
